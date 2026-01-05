@@ -1,9 +1,17 @@
 const db = require("../config/db");
 const admin = require("firebase-admin");
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_API_URL = 'https://api.groq.com/openai/v1';
+const Groq = require("groq-sdk");
 
-// Predefined expense categories
+// Initialize the official Groq SDK
+// This handles headers, retries, and errors much better than manual fetch
+const groq = new Groq({
+    apiKey: process.env.GROQ_API_KEY,
+});
+
+// The current stable 2026 flagship model for Groq's free tier
+const STABLE_MODEL = "llama-3.3-70b-versatile";
+
+// Predefined expense categories (Sync'd with your OCR controller)
 const EXPENSE_CATEGORIES = [
     "Food & Dining", "Transportation", "Shopping", "Bills & Utilities", 
     "Entertainment", "Travel", "Education", "Health & Fitness", 
@@ -11,314 +19,188 @@ const EXPENSE_CATEGORIES = [
     "Insurance", "Gifts & Donations", "Other"
 ];
 
-// Function to call Groq API with retry mechanism
-const callGroqApi = async (messages, model, jsonOnly = false, retries = 2) => {
-    for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-            const systemMessage = messages[0];
-            // If jsonOnly is true, enhance the system prompt to force JSON output
-            if (jsonOnly && systemMessage.role === "system") {
-                systemMessage.content += `\n\nIMPORTANT: You MUST respond ONLY with valid JSON. No explanations, no text before or after the JSON.`;
-            }
+/**
+ * Robust helper function to call Groq API using the SDK
+ * @param {Array} messages - Chat history/prompts
+ * @param {Boolean} jsonOnly - If true, forces JSON mode
+ * @returns {Object} - The completion response
+ */
+const callGroqApi = async (messages, jsonOnly = false) => {
+    try {
+        // Deep clone messages to avoid accidental mutation
+        const sessionMessages = JSON.parse(JSON.stringify(messages));
 
-            const response = await fetch(`${GROQ_API_URL}/chat/completions`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${GROQ_API_KEY}`,
-                },
-                body: JSON.stringify({ 
-                    messages, 
-                    model,
-                    temperature: jsonOnly ? 0.1 : 0.7 // Lower temperature for structured outputs
-                }),
-            });
-
-            if (!response.ok) {
-                const errorBody = await response.json();
-                throw new Error(`Groq API Error: ${errorBody.message || 'Unknown error'}`);
-            }
-
-            return await response.json();
-        } catch (error) {
-            if (attempt === retries) {
-                console.error(`Failed after ${retries} attempts to call Groq API:`, error);
-                throw error;
-            }
-            // Exponential backoff before retry
-            await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+        if (jsonOnly && sessionMessages[0].role === "system") {
+            sessionMessages[0].content += `\n\nIMPORTANT: You MUST respond ONLY with a valid JSON object. Do not include any text, greetings, or explanations before or after the JSON.`;
         }
+
+        const completion = await groq.chat.completions.create({
+            messages: sessionMessages,
+            model: STABLE_MODEL,
+            temperature: jsonOnly ? 0.0 : 0.7, // Lower temp for logic tasks to increase accuracy
+            // This flag is crucial: it tells Groq to strictly enforce JSON output
+            response_format: jsonOnly ? { type: "json_object" } : undefined,
+        });
+
+        return completion;
+    } catch (error) {
+        console.error("Internal Groq SDK Error:", error.message);
+        throw error;
     }
 };
 
-// Extract JSON from a potentially mixed text response
+/**
+ * Helper to safely extract JSON from AI text responses
+ */
 const extractJsonFromText = (text) => {
     try {
-        // Try direct parsing first
+        // Try standard parsing
         return JSON.parse(text);
     } catch (e) {
-        // Look for JSON-like structure with regex
+        // Use regex to find the JSON block if the AI added extra text
         const jsonMatch = text.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
             try {
                 return JSON.parse(jsonMatch[0]);
             } catch (innerError) {
-                throw new Error("Could not extract valid JSON from response");
+                throw new Error("Found JSON structure but it was malformed.");
             }
         }
-        throw new Error("No JSON structure found in response");
+        throw new Error("No JSON found in response.");
     }
 };
 
-// Detect intent from user message
+/**
+ * Step 1: Detect User Intent
+ */
 const detectIntent = async (message) => {
-    const prompt = `You are an assistant that detects intent. Choose only one:
-- "add_expense" if the user mentions spending, buying, paying for something, or a transaction
-- "query" if the user is asking about past spending, totals, or any question about their expenses
-- "chitchat" for greetings, jokes, general conversation, or anything not clearly about adding or querying expenses
+    const prompt = `You are a financial assistant intent detector. Analyze the user message and choose one category:
+- "add_expense": If user mentions spending, buying, paying for something, or a transaction.
+- "query": If user asks about past spending, totals, or budget history.
+- "chitchat": For greetings, jokes, or general conversation.
 
-Respond ONLY with:
-{"intent": "<one_of_add_expense|query|chitchat>"}`;
+Respond ONLY with this JSON: {"intent": "add_expense|query|chitchat"}`;
 
     try {
         const response = await callGroqApi([
             { role: "system", content: prompt },
             { role: "user", content: message }
-        ], "llama3-8b-8192", true);
+        ], true);
 
         const content = response.choices[0].message.content;
-        const parsedContent = extractJsonFromText(content);
-        return parsedContent.intent || "chitchat";
+        const parsed = extractJsonFromText(content);
+        return parsed.intent || "chitchat";
     } catch (error) {
-        console.error("Error detecting intent:", error);
-        return "chitchat"; // Default fallback
+        console.error("Intent Detection Error:", error.message);
+        return "chitchat";
     }
 };
 
-// Map user category to predefined categories
+/**
+ * Step 2: Map User Categories to System Categories
+ */
 const mapToPreDefinedCategory = async (userCategory) => {
-    const prompt = `Map the following user-entered expense category to one of these predefined categories:
-${EXPENSE_CATEGORIES.join(", ")}
-
-User category: "${userCategory}"
-
-Respond ONLY with the SINGLE best matching category from the list. Choose the closest match.`;
+    const prompt = `Map the input to one of these predefined categories: ${EXPENSE_CATEGORIES.join(", ")}. 
+    Respond ONLY with the category name. If unsure, respond "Other".`;
 
     try {
         const response = await callGroqApi([
             { role: "system", content: prompt },
             { role: "user", content: userCategory }
-        ], "llama3-8b-8192");
+        ]);
 
-        const mappedCategory = response.choices[0].message.content.trim();
-        
-        // Validate that the response is one of our predefined categories
-        if (EXPENSE_CATEGORIES.includes(mappedCategory)) {
-            return mappedCategory;
-        }
-        
-        // Default to "Other" if no valid match
-        return "Other";
+        const mapped = response.choices[0].message.content.trim();
+        return EXPENSE_CATEGORIES.includes(mapped) ? mapped : "Other";
     } catch (error) {
-        console.error("Error mapping category:", error);
-        return "Other"; // Default fallback
+        return "Other";
     }
 };
 
-// Extract expense details from user message
+/**
+ * Step 3: Extract Data for "Add Expense" intent
+ */
 const extractExpenseDetails = async (message) => {
     const today = new Date().toISOString().split('T')[0];
-    const prompt = `Extract expense data from text. Return JSON with these fields:
-- amount (number only, no currency symbol)
-- category (descriptive phrase of what was purchased)
-- date (YYYY-MM-DD, assume today ${today} if not specified)
-- title (1-2 words describing the expense, concise and specific)
-
-Examples:
-"I spent 200 on groceries today at Walmart" =>
-{"amount": 200, "category": "groceries", "date": "${today}", "title": "Walmart Groceries"}
-
-"Movie night for 500 on April 1" =>
-{"amount": 500, "category": "movie", "date": "2025-04-01", "title": "Movie Night"}
-
-"Paid 1750 for rent today" =>
-{"amount": 1750, "category": "rent", "date": "${today}", "title": "Monthly Rent"}
-
-Respond ONLY in this JSON format or this error if invalid:
-{"error": "Could not understand the expense details."}`;
+    const prompt = `Extract expense data into JSON.
+Fields: "amount" (number), "category" (string), "date" (YYYY-MM-DD), "title" (max 2 words).
+Assume today is ${today} if no date is mentioned.
+Respond ONLY with the JSON object.`;
 
     try {
         const response = await callGroqApi([
             { role: "system", content: prompt },
             { role: "user", content: message }
-        ], "llama3-8b-8192", true);
+        ], true);
 
         const content = response.choices[0].message.content;
-        const parsedDetails = extractJsonFromText(content);
+        const details = extractJsonFromText(content);
         
-        // If valid response, map the user category to predefined category
-        if (!parsedDetails.error) {
-            parsedDetails.category = await mapToPreDefinedCategory(parsedDetails.category);
+        // Enhance the category mapping
+        if (details.amount && details.category) {
+            details.category = await mapToPreDefinedCategory(details.category);
         }
         
-        return parsedDetails;
+        return details;
     } catch (error) {
-        console.error("Error extracting expense details:", error);
-        return { error: "Failed to parse expense details." };
+        return { error: "Could not parse expense details." };
     }
 };
 
-// Process date periods for queries with improved recognition
+/**
+ * Date Processing Utilities
+ */
 const processDatePeriod = (period) => {
     const today = new Date();
     const result = { from: null, to: null };
-    
-    // Set end date to today by default
     result.to = today.toISOString().split('T')[0];
-    
-    // Normalize the period text to handle variations
-    const normalizedPeriod = period.toLowerCase().trim();
-    
-    // Common time periods with variations
-    if (normalizedPeriod === "today") {
+    const normalized = period.toLowerCase().trim();
+
+    if (normalized === "today") {
         result.from = result.to;
-    } else if (normalizedPeriod === "yesterday") {
+    } else if (normalized === "yesterday") {
         const yesterday = new Date(today);
         yesterday.setDate(today.getDate() - 1);
         result.from = yesterday.toISOString().split('T')[0];
         result.to = result.from;
-    } else if (["this week", "current week", "the week", "week"].includes(normalizedPeriod)) {
+    } else if (["this week", "week"].includes(normalized)) {
         const firstDay = new Date(today);
-        const day = today.getDay() || 7; // Convert Sunday from 0 to 7
-        firstDay.setDate(today.getDate() - day + 1); // Monday of this week
+        const day = today.getDay() || 7;
+        firstDay.setDate(today.getDate() - day + 1);
         result.from = firstDay.toISOString().split('T')[0];
-    } else if (["this month", "current month", "the month", "month"].includes(normalizedPeriod)) {
+    } else if (["this month", "month"].includes(normalized)) {
         result.from = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
-    } else if (["last month", "previous month"].includes(normalizedPeriod)) {
+    } else if (["last month"].includes(normalized)) {
         const lastMonth = new Date(today);
         lastMonth.setMonth(today.getMonth() - 1);
         result.from = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, '0')}-01`;
-        
         const lastDayOfLastMonth = new Date(today.getFullYear(), today.getMonth(), 0);
         result.to = lastDayOfLastMonth.toISOString().split('T')[0];
-    } else if (normalizedPeriod.includes("april") || normalizedPeriod.includes("apr")) {
-        // Handle specific month mentions (April in this case)
-        result.from = `${today.getFullYear()}-04-01`;
-        result.to = `${today.getFullYear()}-04-30`;
-    } else if (normalizedPeriod.includes("march") || normalizedPeriod.includes("mar")) {
-        result.from = `${today.getFullYear()}-03-01`;
-        result.to = `${today.getFullYear()}-03-31`;
-    } else if (normalizedPeriod.includes("february") || normalizedPeriod.includes("feb")) {
-        result.from = `${today.getFullYear()}-02-01`;
-        result.to = `${today.getFullYear()}-02-${today.getFullYear() % 4 === 0 ? '29' : '28'}`;
-    } else if (normalizedPeriod.includes("january") || normalizedPeriod.includes("jan")) {
-        result.from = `${today.getFullYear()}-01-01`;
-        result.to = `${today.getFullYear()}-01-31`;
     } else {
-        // Default to last 30 days if period is unrecognized
+        // Default to last 30 days
         const thirtyDaysAgo = new Date(today);
         thirtyDaysAgo.setDate(today.getDate() - 30);
         result.from = thirtyDaysAgo.toISOString().split('T')[0];
     }
-    
     return result;
 };
 
-// Parse various time-related expressions
-const parseTimeExpression = (expression) => {
-    const today = new Date();
-    
-    // Handle common expressions
-    if (expression.match(/whole month|entire month|full month|this month|current month/i)) {
-        return "this month";
-    }
-    if (expression.match(/last month|previous month/i)) {
-        return "last month";
-    }
-    if (expression.match(/this week|current week/i)) {
-        return "this week";
-    }
-    if (expression.match(/today/i)) {
-        return "today";
-    }
-    if (expression.match(/yesterday/i)) {
-        return "yesterday";
-    }
-    
-    // Handle month names
-    const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
-    const monthAbbreviations = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-    
-    for (let i = 0; i < months.length; i++) {
-        if (expression.includes(months[i]) || expression.includes(monthAbbreviations[i])) {
-            return months[i];
-        }
-    }
-    
-    // Default
-    return "this month";
-};
-
-// Improved function to handle expense queries
+/**
+ * Step 4: Handle "Query" intent
+ */
 const queryExpenses = async (message, userId) => {
     try {
-        const prompt = `You are a finance assistant. Extract query details from the user's message about expenses.
-Return ONLY JSON with these fields:
-- category: The expense category they're asking about (null if not specified)
-- time_period: The time period they're asking about (today, yesterday, this week, this month, last month, or a specific month name)
+        const prompt = `Extract query parameters into JSON: 
+        {"category": "string|null", "time_period": "today|yesterday|this week|this month|last month|month name"}.
+        Categories: ${EXPENSE_CATEGORIES.join(", ")}`;
 
-Examples:
-"How much did I spend on food this month?" => {"category": "Food & Dining", "time_period": "this month"}
-"Show me yesterday's expenses" => {"category": null, "time_period": "yesterday"}
-"What did I spend on transportation last month?" => {"category": "Transportation", "time_period": "last month"}
-"How much did I spend this whole month" => {"category": null, "time_period": "this month"}
-"What were my expenses in April?" => {"category": null, "time_period": "april"}
-
-The available expense categories are: ${EXPENSE_CATEGORIES.join(", ")}
-Map to the closest category or return null if no category is mentioned.`;
-
-        const apiResponse = await callGroqApi([
+        const response = await callGroqApi([
             { role: "system", content: prompt },
             { role: "user", content: message }
-        ], "llama3-8b-8192", true);
+        ], true);
 
-        // Parse query parameters
-        let queryParams;
-        try {
-            queryParams = extractJsonFromText(apiResponse.choices[0].message.content);
-        } catch (error) {
-            console.error("Failed to parse query parameters:", error);
-            
-            // Fallback approach: Use a simpler parsing strategy
-            const category = EXPENSE_CATEGORIES.find(cat => 
-                message.toLowerCase().includes(cat.toLowerCase())
-            );
-            
-            let time_period = "this month"; // Default
-            
-            // Very simple time period detection as backup
-            if (message.toLowerCase().includes("today")) {
-                time_period = "today";
-            } else if (message.toLowerCase().includes("yesterday")) {
-                time_period = "yesterday";
-            } else if (message.toLowerCase().includes("week")) {
-                time_period = "this week";
-            } else if (message.toLowerCase().includes("month")) {
-                time_period = parseTimeExpression(message.toLowerCase());
-            }
-            
-            queryParams = { 
-                category: category || null, 
-                time_period 
-            };
-        }
-        
-        const { category, time_period } = queryParams;
-        
-        // Process the date period to get from/to dates
-        const { from, to } = processDatePeriod(time_period);
-        
-        // Build the Firebase query
+        const { category, time_period } = extractJsonFromText(response.choices[0].message.content);
+        const { from, to } = processDatePeriod(time_period || "this month");
+
         let query = db.collection("expenses")
             .where("userId", "==", userId)
             .where("date", ">=", from)
@@ -326,168 +208,89 @@ Map to the closest category or return null if no category is mentioned.`;
             
         let categoryFilter = null;
         if (category) {
-            // If category is specified, try to map it to our predefined categories
             categoryFilter = await mapToPreDefinedCategory(category);
             query = query.where("category", "==", categoryFilter);
         }
 
-        // Execute query
         const snapshot = await query.get();
-        
         if (snapshot.empty) {
-            return `No expenses found ${categoryFilter ? `for ${categoryFilter}` : ""} ${time_period}.`;
+            return `I couldn't find any expenses ${categoryFilter ? `for ${categoryFilter}` : ""} from ${from} to ${to}.`;
         }
 
-        // Process results
         let total = 0;
-        const expenses = [];
+        snapshot.forEach(doc => total += doc.data().amount);
         
-        snapshot.forEach(doc => {
-            const data = doc.data();
-            total += data.amount;
-            expenses.push(data);
-        });
+        return `You spent ₹${total.toLocaleString()} ${categoryFilter ? `on ${categoryFilter}` : "in total"} for ${time_period || "this period"}.`;
 
-        // Format the time period for display
-        let formattedPeriod;
-        if (time_period === "today") {
-            formattedPeriod = "today";
-        } else if (time_period === "yesterday") {
-            formattedPeriod = "yesterday";
-        } else if (time_period === "this week" || time_period === "current week") {
-            formattedPeriod = "this week";
-        } else if (time_period === "this month" || time_period === "current month") {
-            formattedPeriod = "this month";
-        } else if (time_period === "last month" || time_period === "previous month") {
-            formattedPeriod = "last month";
-        } else if (time_period.match(/january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec/i)) {
-            // If it's a month name, capitalize the first letter
-            formattedPeriod = "in " + time_period.charAt(0).toUpperCase() + time_period.slice(1);
-        } else {
-            formattedPeriod = `for ${time_period}`;
-        }
-
-        const categoryText = categoryFilter ? `on ${categoryFilter}` : "in total";
-        
-        let response = `You spent ₹${total.toLocaleString()} ${categoryText} ${formattedPeriod} (${expenses.length} transaction${expenses.length !== 1 ? 's' : ''}).`;
-        
-        // Add breakdown of top categories if no category filter was applied
-        if (!categoryFilter && expenses.length > 1) {
-            // Group by category
-            const categoryTotals = {};
-            expenses.forEach(exp => {
-                if (!categoryTotals[exp.category]) categoryTotals[exp.category] = 0;
-                categoryTotals[exp.category] += exp.amount;
-            });
-            
-            // Get top 3 categories
-            const topCategories = Object.entries(categoryTotals)
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, 3);
-                
-            if (topCategories.length > 0) {
-                response += " Top categories: " + topCategories
-                    .map(([cat, amt]) => `${cat} (₹${amt.toLocaleString()})`)
-                    .join(", ");
-            }
-        }
-        
-        return response;
-        
     } catch (error) {
-        console.error("Error processing query:", error);
-        return "I couldn't process your query. Please try asking in a different way, like 'How much did I spend this month?' or 'What were my food expenses yesterday?'";
+        return "I'm sorry, I'm having trouble accessing your expense history right now.";
     }
 };
 
-// Generate chitchat responses
+/**
+ * Step 5: Handle "Chitchat" intent
+ */
 const generateChitchatResponse = async (message) => {
     try {
         const response = await callGroqApi([
             {
                 role: "system",
-                content: `You are a friendly expense-tracking assistant who replies casually and politely. 
-                Keep replies short, natural and helpful. You help users track their spending. If they ask about
-                spending or expenses but you can't understand the specific query, suggest they try asking in a clearer format
-                like "How much did I spend on [category] [time period]?" or "What were my expenses [time period]?".`,
+                content: "You are WalletWise, a friendly and polite financial assistant. Keep your answers helpful and under 2 sentences."
             },
             { role: "user", content: message }
-        ], "llama3-8b-8192");
-
+        ]);
         return response.choices[0].message.content;
     } catch (error) {
-        console.error("Error generating chitchat response:", error);
-        return "I'm here to help with your expenses. You can ask me things like 'How much did I spend this month?' or tell me about new expenses like 'I spent ₹200 on lunch today'.";
+        return "I'm here to help you manage your money! What can I do for you today?";
     }
 };
 
-// Handle month name responses
+/**
+ * Month Name Shortcut Logic
+ */
 const handleMonthNameResponse = async (message, userId) => {
-    // Check if message contains a month name
-    const monthNames = ["january", "february", "march", "april", "may", "june", 
-                        "july", "august", "september", "october", "november", "december",
-                        "jan", "feb", "mar", "apr", "may", "jun", 
-                        "jul", "aug", "sep", "oct", "nov", "dec"];
-    
-    const normalizedMessage = message.toLowerCase();
-    const matchedMonth = monthNames.find(month => normalizedMessage.includes(month));
-    
-    if (matchedMonth) {
-        // Treat this as a query for that month
-        return await queryExpenses(`How much did I spend in ${matchedMonth}?`, userId);
-    }
-    
-    return null; // Not a month name response
+    const monthNames = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+    const normalized = message.toLowerCase();
+    const matched = monthNames.find(m => normalized.includes(m));
+    if (matched) return await queryExpenses(`Expenses for ${matched}`, userId);
+    return null;
 };
 
-// Main controller function with conversation context
-const conversationCache = new Map(); // Simple in-memory cache for conversation context
+// Simple context cache to track conversational flow
+const conversationCache = new Map();
 
+/**
+ * MAIN CONTROLLER EXPORT
+ */
 exports.interactWithChatbot = async (req, res) => {
     const { message } = req.body;
     const userId = req.user.uid;
 
+    if (!message) return res.status(400).json({ error: "Message is required" });
+
     try {
-        // Check if this might be a follow-up about a month
-        const monthResponse = await handleMonthNameResponse(message, userId);
-        if (monthResponse) {
-            return res.json({ success: true, message: monthResponse });
-        }
+        // Priority 1: Check if it's a month-name shortcut
+        const monthRes = await handleMonthNameResponse(message, userId);
+        if (monthRes) return res.json({ success: true, message: monthRes });
 
-        // Get conversation context or initialize it
+        // Priority 2: Initialize or Refresh Context
         if (!conversationCache.has(userId)) {
-            conversationCache.set(userId, {
-                lastIntent: null,
-                lastQuery: null,
-                timestamp: Date.now()
-            });
+            conversationCache.set(userId, { lastIntent: null, timestamp: Date.now() });
         }
-        
         const context = conversationCache.get(userId);
-        
-        // Check if we should clear context due to time (expire after 30 minutes)
-        if (Date.now() - context.timestamp > 30 * 60 * 1000) {
-            context.lastIntent = null;
-            context.lastQuery = null;
-        }
-        
-        // Update timestamp
-        context.timestamp = Date.now();
 
-        // Detect intent
+        // Priority 3: Detect Intent and Execute
         const intent = await detectIntent(message);
         context.lastIntent = intent;
+        context.timestamp = Date.now();
 
+        // ADD EXPENSE
         if (intent === "add_expense") {
             const details = await extractExpenseDetails(message);
             if (details.error) return res.status(400).json({ error: details.error });
 
             const { amount, category, date, title } = details;
-            if (isNaN(parseFloat(amount)) || !category || !date || !title) {
-                return res.status(400).json({ error: "Incomplete expense information." });
-            }
-
-            // Add the expense to Firestore
+            
             await db.collection("expenses").add({
                 userId,
                 amount: parseFloat(amount),
@@ -499,30 +302,25 @@ exports.interactWithChatbot = async (req, res) => {
 
             return res.json({ 
                 success: true, 
-                message: `✅ Added ₹${amount} for ${title} (${category}) on ${date}.` 
+                message: `✅ Logged ₹${amount} for "${title}" in ${category}.` 
             });
         }
 
+        // QUERY EXPENSES
         if (intent === "query") {
-            context.lastQuery = message;
-            const result = await queryExpenses(message, userId);
-            return res.json({ success: true, message: result });
+            const queryResult = await queryExpenses(message, userId);
+            return res.json({ success: true, message: queryResult });
         }
 
-        // Special handling for month names if the previous intent was a query
-        if (context.lastIntent === "query" && /^(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)$/i.test(message.trim())) {
-            const result = await queryExpenses(`How much did I spend in ${message.trim()}?`, userId);
-            return res.json({ success: true, message: result });
-        }
-
+        // CHITCHAT / DEFAULT
         const reply = await generateChitchatResponse(message);
         return res.json({ success: true, message: reply });
 
     } catch (err) {
-        console.error("Chatbot error:", err);
+        console.error("Critical Chatbot Error:", err);
         return res.status(500).json({ 
-            error: "Something went wrong while processing your message.",
-            message: "I'm having trouble understanding that. Try asking about your spending like 'How much did I spend today?' or add an expense like 'I spent ₹250 on dinner'."
+            error: "Something went wrong.",
+            message: "I'm having trouble connecting to my brain! Try asking again in a moment."
         });
     }
 };
