@@ -62,7 +62,10 @@ exports.processReceipt = async (req, res) => {
 
     // Call Gemini Vision API to analyze the receipt
     console.log('Calling Gemini Vision API');
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const model = genAI.getGenerativeModel(
+  { model: 'gemini-2.5-flash' }, 
+  { apiVersion: 'v1' }
+);
     
     const predefinedCategories = [
       "Food & Dining",
